@@ -1,0 +1,229 @@
+```{r set-options,echo=FALSE}
+options(width=100);
+knitr::opts_chunk$set(message = FALSE);
+```
+
+---
+title: "Predicting the accuracy of barbell exercises"
+author: "Student 749"
+date: "Thursday, March 19, 2015"
+output: html_document
+---
+
+# Synopsis
+The modern "quantified self movement" implies using wearable devices such as Jawbone Up, Nike FuelBand, and Fitbit. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, our goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. [More information on Groupware@LES website](http://groupware.les.inf.puc-rio.br/har) (see the section on the Weight Lifting Exercise Dataset).
+
+Our goal is to build the model that predicts type of execution (variable "classe" is the outcome). Value "A" means correct execution, four others, "B", "C", "D", and "E", are types of common mistakes. Predictors are readings from accelerometers.
+
+First we load training and test data, and split training data into train (70%) and validation (30%) datasets. After short preprocessing, we build the first model to calculate the variables' importance. Thus we can reduce the number of predictors in order to make modelling less resource consuming.
+
+After that, we build two competing models based on Random Forest and Gradient Boosting algorithms. In this case, Random Forest gave us a little bit more accuracy. So we use it on the test set and get 20/20 accuracy on submission.
+
+# Data loading, cleaning and preprocessing
+
+We start with loading training and testing data.
+```{r}
+library(caret);
+set.seed(123);
+temp <- tempfile();
+
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",temp);
+data <- read.csv(temp, row.names=1);
+unlink(temp);
+
+download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",temp);
+test <- read.csv(temp, row.names=1);
+unlink(temp);
+rm(temp);
+```
+
+We have large training dataset "data" - `r dim(data)[1]` observations, and small test dataset "test" - `r dim(test)[1]` observations. In these conditions, we split data and use 70% of its observations for training models and 30% for models' validation.
+
+```{r}
+inTrain <- createDataPartition(y=data$classe, p=0.7, list=FALSE);
+train <- data[inTrain,];
+validation <- data[-inTrain,];
+```
+
+Let's look at our data closer.
+
+```{r}
+str(train, list.len=200);
+```
+
+Obviously, many variables have lots of blank or "NA" values. We want to get rid of such features to optimize the training process. We use 95% constraint of emptiness to eliminate variables.
+
+```{r}
+is.empty <- function(x) {is.na(x) || is.null(x) || x==""};
+
+# Count share of empty cells in each column, and get rid of almost empty columns
+
+col.void <- sapply(1:ncol(train), function(i) {sum(sapply(train[,i], is.empty))/length(train[,i])});
+train <- train[,col.void<0.95];
+```
+
+Now lets exclude columns which don't contain accelerometer information (e.g. subjects' names, time, etc.)
+```{r}
+train <- train[,-c(1:6)];
+```
+
+Even now, we have lots of predictors - `r dim(train)[2]-1`. This may cause "expensive" training process and possible overfitting. Lets find out variables' importance.
+
+# First modelling
+
+We build the first model using random sample of 3000 observations.
+
+```{r}
+n <-3000;
+
+train.first <- train[sample(1:dim(train)[1],n),];
+
+# dataset for rough estimation of the first model performance
+train.first.est <- train[sample(1:dim(train)[1],n),];
+
+```
+
+We use Random Forest algorithm for our first model as a well known, accurate and effective modelling tool. This is not our final model, though, but just a step to see variables' importance.
+
+First, we need to assign train parameters for this and subsequent models. In order to make the Cross-Validation as a part of training process, we must put resampling method = CV (default is boot). Thus we use the cross-validation built into the train() function.
+
+And we put the number of K-folds = 5 (default=10) to reduce execution time of train().
+
+```{r}
+trc <- trainControl(method="cv", number=5);
+```
+
+Now we start the first modelling. Note that we restrict the number of trees by 100.
+
+```{r}
+start <- Sys.time();
+
+modelFit1 <- train(classe ~ ., data=train.first, method="rf", trControl=trc, ntree=100);
+
+Sys.time()-start;
+```
+
+Lets look at the first model's performance on our random subsample from train dataset:
+
+```{r}
+confusionMatrix(train.first.est$classe, predict(modelFit1, train.first.est));
+```
+
+Already not bad for accuracy metrics, but we estimated them only on the training subsample. So lets get back to variables' importance.
+
+```{r}
+impvars<-varImp(modelFit1);
+
+imp <- data.frame(var=rownames(impvars$importance), importance=impvars$importance$Overall);
+
+imp <- imp[order(imp$importance, decreasing = TRUE),];
+
+imp;
+```
+
+Thus we have only two features with importance higher than 50%. Let's plot them against each other and use color to see different types of outcome.
+
+```{r}
+g <- ggplot(train, aes_string(x=as.character(imp[1,1]), y=as.character(imp[2,1])));
+g <- g + geom_point(size=3, alpha = 0.7, aes(color=classe));
+print(g);
+```
+
+As we see, there are no clear patterns here, though this figure gives something to think of. Obviously, we can't draw decision boundaries based on this plot. So we must take in account other predictors. We would like to take variables with importance > 2.
+
+```{r}
+vip <- as.character(imp[imp$importance > 2, 1]);
+```
+
+Thus we get the vector of important variables of length `r length(vip)`.  
+
+```{r}
+train <- train[,c(vip,"classe")];
+```
+
+# Main modelling
+
+Now we have preprocessed the dataset "train" and ready to start modelling. Due to the constraints of this report, we will try only two algorithms commonly used for prediction in classification problems: random forest and gradient boosting.
+
+## Random forest
+
+```{r}
+start <- Sys.time();
+
+modelFit.rf <- train(classe ~ ., data=train, method="rf", trControl=trc, ntree=100);
+
+Sys.time()-start;
+```
+
+Let's see our new model's parameters, particularly at Accuracy (see the bottom of that next block), calculated during built-in Cross-Validation. Thus we can evaluate the expected out-of-sample error (which is 1-Accuracy).
+
+```{r}
+modelFit.rf;
+```
+
+Now we can estimate the quality of our model by predicting on the validation dataset:
+
+```{r}
+confusionMatrix(validation$classe, predict(modelFit.rf, validation));
+```
+
+
+## Gradient boosting
+
+```{r, results='hide'}
+start <- Sys.time();
+
+gbmGrid <- expand.grid(.interaction.depth = 20, .n.trees = 50, .shrinkage = 0.1)
+modelFit.gbm <- train(classe ~ ., data=train, method="gbm", trControl=trc, tuneGrid = gbmGrid);
+
+```
+```{r}
+Sys.time()-start;
+```
+
+Lets look at the model parameters, and again, particularly at Accuracy.
+
+```{r}
+modelFit.gbm;
+```
+
+..and second model prediction on the validation dataset:
+
+```{r}
+confusionMatrix(validation$classe, predict(modelFit.gbm, validation));
+```
+
+
+# Conclusions
+
+As we see, Random Forest has a little bit more Accuracy, and therefore less expected out-of-sample error in this case. We will use our **modelFit.rf** to predict the outcome on test dataset.
+
+```{r}
+answers<-as.character(predict(modelFit.rf,test));
+answers;
+```
+
+Now we write answers to the files for submission:
+
+```{r, echo=FALSE}
+setwd("C:/R");
+wd <- getwd();
+```
+
+```{r}
+pml_write_files = function(x)
+        {
+        n = length(x)
+        for(i in 1:n){
+                filename = paste0(wd,"/Practical_Machine_Learning/CP_answers/problem_id_",i,".txt")
+                write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+        }
+}
+
+pml_write_files(answers);
+```
+
+The result of the task submission on test data is 20/20. We can conclude that the model modelFit.rf works well.  
+
